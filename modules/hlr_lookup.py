@@ -163,3 +163,130 @@ class HLRLookup:
         if used_http:
             result["transport"] = "http"
         return result
+
+    def print_result(self, result: Dict):
+        print(f"\n{Colors.CYAN}{'='*50}{Colors.RESET}")
+        print(f"{Colors.BOLD}HLR Lookup Result{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*50}{Colors.RESET}")
+
+        if result.get("error"):
+            print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
+            return
+
+        status = f"{Colors.GREEN}Valid{Colors.RESET}" if result["valid"] else f"{Colors.RED}Invalid{Colors.RESET}"
+
+        print(f"{Colors.YELLOW}Phone:{Colors.RESET} {result.get('formatted', result['phone'])}")
+        print(f"{Colors.YELLOW}Status:{Colors.RESET} {status}")
+        print(f"{Colors.YELLOW}Type:{Colors.RESET} {result.get('line_type', 'N/A')}")
+        print(f"{Colors.YELLOW}Carrier:{Colors.RESET} {result.get('carrier') or 'N/A'}")
+        print(f"{Colors.YELLOW}Country:{Colors.RESET} {result.get('country') or result.get('country_name', 'N/A')}")
+        print(f"{Colors.YELLOW}Region:{Colors.RESET} {result.get('region') or result.get('location', 'N/A')}")
+
+        if result.get("timezones"):
+            print(f"{Colors.YELLOW}Timezones:{Colors.RESET} {', '.join(result['timezones'])}")
+
+    def reverse_lookup(self, phone: str) -> Dict[str, Any]:
+        from modules.module_status import annotate, ERROR
+        result = {
+            "phone": phone,
+            "names": [],
+            "city": None,
+            "carrier_confirmed": None,
+            "comments": [],
+            "sources": [],
+            "sources_failed": [],
+            "error": None,
+        }
+
+        clean = phone.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+        try:
+            proxies = get_proxies()
+            r = requests.get(
+                f"https://api.numlookupapi.com/v1/validate/{clean}",
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
+                proxies=proxies,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("city"):
+                    result["city"] = data["city"]
+                if data.get("carrier"):
+                    result["carrier_confirmed"] = data["carrier"]
+                result["sources"].append("numlookupapi.com")
+            else:
+                result["sources_failed"].append({"source": "numlookupapi.com", "reason": f"HTTP {r.status_code}"})
+        except Exception as e:
+            result["sources_failed"].append({"source": "numlookupapi.com", "reason": type(e).__name__})
+
+        is_ru = clean.startswith("7") or clean.startswith("89") or clean.startswith("87")
+        if is_ru:
+            if clean.startswith("7"):
+                ru_num = clean[1:]
+            elif clean.startswith("89") or clean.startswith("87"):
+                ru_num = clean[1:]
+            else:
+                ru_num = clean
+
+            for site_url, site_name in [
+                (f"https://kto-zvonil.ru/nomer/7{ru_num}/", "kto-zvonil.ru"),
+                (f"https://zvonili.com/phone/7{ru_num}/", "zvonili.com"),
+            ]:
+                try:
+                    import re
+                    proxies = get_proxies()
+                    r = requests.get(
+                        site_url,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                        timeout=8,
+                        proxies=proxies,
+                    )
+                    if r.status_code == 200:
+                        text = r.text
+                        name_matches = re.findall(
+                            r'(?:владелец|зарегистрирован на|Имя абонента|owner_name)[^\w]*:?\s*([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})',
+                            text
+                        )
+                        for n in name_matches[:3]:
+                            if n not in result["names"]:
+                                result["names"].append(n)
+                        comments = re.findall(
+                            r'<(?:p|div|span)[^>]*class="[^"]*comment[^"]*"[^>]*>([^<]{10,120})<',
+                            text, re.IGNORECASE
+                        )
+                        for c in comments[:3]:
+                            c = c.strip()
+                            if c and c not in result["comments"]:
+                                result["comments"].append(c)
+                        result["sources"].append(site_name)
+                    else:
+                        result["sources_failed"].append({"source": site_name, "reason": f"HTTP {r.status_code}"})
+                except Exception as e:
+                    result["sources_failed"].append({"source": site_name, "reason": type(e).__name__})
+
+        if result["sources_failed"] and not result["sources"]:
+            annotate(result, ERROR, "All reverse lookup sources failed")
+
+        return result
+
+
+def run_hlr_lookup():
+    hlr = HLRLookup()
+
+    print(f"\n{Colors.BOLD}HLR Lookup - Mobile Number Checker{Colors.RESET}")
+    print(f"{Colors.CYAN}Enter phone number with country code (e.g., +79001234567){Colors.RESET}")
+
+    phone = input(f"\n{Colors.GREEN}Phone number: {Colors.RESET}").strip()
+
+    if not phone:
+        print(f"{Colors.RED}No phone number provided{Colors.RESET}")
+        return None
+
+    result = hlr.validate_phone(phone)
+    hlr.print_result(result)
+
+    return result
+
+if __name__ == "__main__":
+    run_hlr_lookup()
