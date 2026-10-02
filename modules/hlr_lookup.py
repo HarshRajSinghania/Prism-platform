@@ -1,1 +1,292 @@
-PLACEHOLDER
+import os
+import requests
+import phonenumbers
+from phonenumbers import carrier, geocoder, timezone
+from typing import Dict, Any, Optional
+import sys
+sys.path.append('..')
+from config import Colors, NUMVERIFY_API_KEY, USER_AGENT
+from modules import get_proxies
+
+
+class HLRLookup:
+
+    def __init__(self):
+        self.api_key = NUMVERIFY_API_KEY
+        self.numverify_url = "https://apilayer.net/api/validate"
+
+    def validate_phone(self, phone: str, country_code: str = None) -> Dict[str, Any]:
+        result = {
+            "phone": phone,
+            "valid": False,
+            "carrier": None,
+            "country": None,
+            "region": None,
+            "timezones": [],
+            "line_type": None,
+            "formatted": None,
+            "error": None
+        }
+
+        try:
+            if country_code:
+                parsed = phonenumbers.parse(phone, country_code)
+            else:
+                if not phone.startswith('+'):
+                    phone = '+' + phone
+                parsed = phonenumbers.parse(phone)
+
+            result["valid"] = phonenumbers.is_valid_number(parsed)
+            result["formatted"] = phonenumbers.format_number(
+                parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL
+            )
+
+            result["carrier"] = carrier.name_for_number(parsed, "en")
+
+            region_code = phonenumbers.region_code_for_number(parsed)
+            result["country_code"] = region_code
+            result["region"] = geocoder.description_for_number(parsed, "en")
+
+            from phonenumbers import PhoneMetadata
+            _country_names = {
+                "US": "United States", "GB": "United Kingdom", "DE": "Germany",
+                "FR": "France", "RU": "Russia", "CN": "China", "JP": "Japan",
+                "IN": "India", "BR": "Brazil", "AU": "Australia", "CA": "Canada",
+                "IT": "Italy", "ES": "Spain", "NL": "Netherlands", "SE": "Sweden",
+                "NO": "Norway", "DK": "Denmark", "FI": "Finland", "PL": "Poland",
+                "AT": "Austria", "CH": "Switzerland", "BE": "Belgium", "PT": "Portugal",
+                "IE": "Ireland", "CZ": "Czech Republic", "GR": "Greece", "TR": "Turkey",
+                "KR": "South Korea", "MX": "Mexico", "AR": "Argentina", "CO": "Colombia",
+                "ZA": "South Africa", "UA": "Ukraine", "KZ": "Kazakhstan", "IL": "Israel",
+                "AE": "United Arab Emirates", "SA": "Saudi Arabia", "TH": "Thailand",
+                "VN": "Vietnam", "PH": "Philippines", "ID": "Indonesia", "MY": "Malaysia",
+                "SG": "Singapore", "NZ": "New Zealand", "HK": "Hong Kong", "TW": "Taiwan",
+            }
+            result["country"] = _country_names.get(region_code, region_code or geocoder.description_for_number(parsed, "en"))
+
+            result["timezones"] = list(timezone.time_zones_for_number(parsed))
+
+            number_type = phonenumbers.number_type(parsed)
+            type_map = {
+                phonenumbers.PhoneNumberType.MOBILE: "Mobile",
+                phonenumbers.PhoneNumberType.FIXED_LINE: "Fixed Line",
+                phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fixed Line or Mobile",
+                phonenumbers.PhoneNumberType.TOLL_FREE: "Toll Free",
+                phonenumbers.PhoneNumberType.PREMIUM_RATE: "Premium Rate",
+                phonenumbers.PhoneNumberType.VOIP: "VoIP",
+                phonenumbers.PhoneNumberType.PERSONAL_NUMBER: "Personal",
+                phonenumbers.PhoneNumberType.UNKNOWN: "Unknown"
+            }
+            result["line_type"] = type_map.get(number_type, "Unknown")
+
+            if self.api_key:
+                api_result = self._numverify_lookup(phone)
+                if api_result:
+                    result.update(api_result)
+
+        except phonenumbers.NumberParseException as e:
+            result["error"] = f"Parse error: {str(e)}"
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
+    @staticmethod
+    def _http_fallback_allowed() -> bool:
+        return os.getenv("NUMVERIFY_ALLOW_HTTP", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _numverify_lookup(self, phone: str) -> Optional[Dict]:
+        params = {
+            "access_key": self.api_key,
+            "number": phone.replace("+", "").replace(" ", ""),
+            "format": 1
+        }
+        urls = [self.numverify_url]
+        if self._http_fallback_allowed():
+            fallback = self.numverify_url.replace("https://", "http://", 1)
+            if fallback not in urls:
+                urls.append(fallback)
+
+        last_error = "request failed"
+        used_http = False
+        for url in urls:
+            transport = "http" if url.startswith("http://") else "https"
+            if transport == "http":
+                used_http = True
+            try:
+                proxies = get_proxies()
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=10,
+                    proxies=proxies,
+                )
+            except requests.Timeout:
+                last_error = "timeout"
+                continue
+            except requests.RequestException as exc:
+                last_error = type(exc).__name__
+                continue
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            try:
+                data = response.json()
+            except ValueError:
+                last_error = "invalid JSON"
+                continue
+            err = data.get("error") or {}
+            if isinstance(err, dict) and err.get("code") == 105:
+                last_error = "HTTPS not available on this plan"
+                continue
+            if isinstance(err, dict) and err:
+                info = err.get("info") or err.get("type") or err.get("code") or "request failed"
+                return self._numverify_failure(str(info), used_http)
+            if data.get("valid"):
+                result = {
+                    "country_code": data.get("country_code"),
+                    "country_name": data.get("country_name"),
+                    "location": data.get("location"),
+                    "carrier": data.get("carrier") or None,
+                    "line_type": data.get("line_type"),
+                }
+                if used_http:
+                    result["transport"] = "http"
+                return result
+            last_error = "number reported invalid"
+            return self._numverify_failure(last_error, used_http)
+        return self._numverify_failure(last_error, used_http)
+
+    @staticmethod
+    def _numverify_failure(reason: str, used_http: bool) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"numverify_error": reason}
+        if used_http:
+            result["transport"] = "http"
+        return result
+
+    def print_result(self, result: Dict):
+        print(f"\n{Colors.CYAN}{'='*50}{Colors.RESET}")
+        print(f"{Colors.BOLD}HLR Lookup Result{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*50}{Colors.RESET}")
+
+        if result.get("error"):
+            print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
+            return
+
+        status = f"{Colors.GREEN}Valid{Colors.RESET}" if result["valid"] else f"{Colors.RED}Invalid{Colors.RESET}"
+
+        print(f"{Colors.YELLOW}Phone:{Colors.RESET} {result.get('formatted', result['phone'])}")
+        print(f"{Colors.YELLOW}Status:{Colors.RESET} {status}")
+        print(f"{Colors.YELLOW}Type:{Colors.RESET} {result.get('line_type', 'N/A')}")
+        print(f"{Colors.YELLOW}Carrier:{Colors.RESET} {result.get('carrier') or 'N/A'}")
+        print(f"{Colors.YELLOW}Country:{Colors.RESET} {result.get('country') or result.get('country_name', 'N/A')}")
+        print(f"{Colors.YELLOW}Region:{Colors.RESET} {result.get('region') or result.get('location', 'N/A')}")
+
+        if result.get("timezones"):
+            print(f"{Colors.YELLOW}Timezones:{Colors.RESET} {', '.join(result['timezones'])}")
+
+    def reverse_lookup(self, phone: str) -> Dict[str, Any]:
+        from modules.module_status import annotate, ERROR
+        result = {
+            "phone": phone,
+            "names": [],
+            "city": None,
+            "carrier_confirmed": None,
+            "comments": [],
+            "sources": [],
+            "sources_failed": [],
+            "error": None,
+        }
+
+        clean = phone.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+        try:
+            proxies = get_proxies()
+            r = requests.get(
+                f"https://api.numlookupapi.com/v1/validate/{clean}",
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
+                proxies=proxies,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("city"):
+                    result["city"] = data["city"]
+                if data.get("carrier"):
+                    result["carrier_confirmed"] = data["carrier"]
+                result["sources"].append("numlookupapi.com")
+            else:
+                result["sources_failed"].append({"source": "numlookupapi.com", "reason": f"HTTP {r.status_code}"})
+        except Exception as e:
+            result["sources_failed"].append({"source": "numlookupapi.com", "reason": type(e).__name__})
+
+        is_ru = clean.startswith("7") or clean.startswith("89") or clean.startswith("87")
+        if is_ru:
+            if clean.startswith("7"):
+                ru_num = clean[1:]
+            elif clean.startswith("89") or clean.startswith("87"):
+                ru_num = clean[1:]
+            else:
+                ru_num = clean
+
+            for site_url, site_name in [
+                (f"https://kto-zvonil.ru/nomer/7{ru_num}/", "kto-zvonil.ru"),
+                (f"https://zvonili.com/phone/7{ru_num}/", "zvonili.com"),
+            ]:
+                try:
+                    import re
+                    proxies = get_proxies()
+                    r = requests.get(
+                        site_url,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                        timeout=8,
+                        proxies=proxies,
+                    )
+                    if r.status_code == 200:
+                        text = r.text
+                        name_matches = re.findall(
+                            r'(?:\u0432\u043b\u0430\u0434\u0435\u043b\u0435\u0446|\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d \u043d\u0430|\u0418\u043c\u044f \u0430\u0431\u043e\u043d\u0435\u043d\u0442\u0430|owner_name)[^\w]*:?\s*([\u0410-\u042f\u0401][\u0430-\u044f\u0451]+(?:\s+[\u0410-\u042f\u0401][\u0430-\u044f\u0451]+){1,2})',
+                            text
+                        )
+                        for n in name_matches[:3]:
+                            if n not in result["names"]:
+                                result["names"].append(n)
+                        comments = re.findall(
+                            r'<(?:p|div|span)[^>]*class="[^"]*comment[^"]*"[^>]*>([^<]{10,120})<',
+                            text, re.IGNORECASE
+                        )
+                        for c in comments[:3]:
+                            c = c.strip()
+                            if c and c not in result["comments"]:
+                                result["comments"].append(c)
+                        result["sources"].append(site_name)
+                    else:
+                        result["sources_failed"].append({"source": site_name, "reason": f"HTTP {r.status_code}"})
+                except Exception as e:
+                    result["sources_failed"].append({"source": site_name, "reason": type(e).__name__})
+
+        if result["sources_failed"] and not result["sources"]:
+            annotate(result, ERROR, "All reverse lookup sources failed")
+
+        return result
+
+
+def run_hlr_lookup():
+    hlr = HLRLookup()
+
+    print(f"\n{Colors.BOLD}HLR Lookup - Mobile Number Checker{Colors.RESET}")
+    print(f"{Colors.CYAN}Enter phone number with country code (e.g., +79001234567){Colors.RESET}")
+
+    phone = input(f"\n{Colors.GREEN}Phone number: {Colors.RESET}").strip()
+
+    if not phone:
+        print(f"{Colors.RED}No phone number provided{Colors.RESET}")
+        return None
+
+    result = hlr.validate_phone(phone)
+    hlr.print_result(result)
+
+    return result
+
+if __name__ == "__main__":
+    run_hlr_lookup()
